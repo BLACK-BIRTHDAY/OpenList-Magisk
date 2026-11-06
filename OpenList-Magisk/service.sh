@@ -252,7 +252,21 @@ patch_openlist_binary_sqlite_dsn() {
     [ ! -f "$bin_file" ] && return 0
     [ ! -w "$bin_file" ] && return 0
 
-    if grep -a -qF '%s?_journal=WAL&_vacuum=incremental' "$bin_file" 2>/dev/null; then
+    local offsets
+    offsets=$(grep -a -b -oF '%s?_journal=WAL&_vacuum=incremental' "$bin_file" 2>/dev/null | cut -d: -f1)
+    if [ -n "$offsets" ]; then
+        local patched=0
+        for offset in $offsets; do
+            if [ -n "$offset" ] && printf '%%s?_pragma=busy_timeout(10000)&_v=1' | dd of="$bin_file" bs=1 seek="$offset" count=35 conv=notrunc 2>/dev/null; then
+                patched=1
+            fi
+        done
+        if [ "$patched" -eq 1 ]; then
+            chmod 755 "$bin_file" 2>/dev/null || true
+            restorecon "$bin_file" 2>/dev/null || chcon u:object_r:system_file:s0 "$bin_file" 2>/dev/null || true
+            log "已修补 OpenList 二进制 SQLite 连接参数 (busy_timeout=10000ms)"
+        fi
+    elif grep -a -qF '%s?_journal=WAL&_vacuum=incremental' "$bin_file" 2>/dev/null; then
         if LC_ALL=C sed -b -i 's|%s?_journal=WAL&_vacuum=incremental|%s?_pragma=busy_timeout(10000)\&_v=1|g' "$bin_file" 2>/dev/null || \
            LC_ALL=C sed -i 's|%s?_journal=WAL&_vacuum=incremental|%s?_pragma=busy_timeout(10000)\&_v=1|g' "$bin_file" 2>/dev/null; then
             chmod 755 "$bin_file" 2>/dev/null || true

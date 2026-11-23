@@ -16,6 +16,18 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# 从 service.sh 读取安装/迁移后的实际路径（兼容旧版 ${VAR:-...} 写法）
+get_service_var() {
+    local val
+    val="$(sed -n "s/^$1=\"\\(.*\\)\"/\\1/p" "$MODROOT/service.sh" 2>/dev/null | head -n 1)"
+    case "$val" in
+        '${'"$1"':-'*'}')
+            val="$(printf '%s\n' "$val" | sed -e "s/^[$]{$1:-//" -e 's/}$//')"
+            ;;
+    esac
+    printf '%s\n' "$val"
+}
+
 # 停止服务函数
 stop_service() {
     if pgrep -f openlist >/dev/null; then
@@ -38,8 +50,11 @@ stop_service() {
 # 清理二进制文件
 clean_binaries() {
     local found=0
-    local paths="/data/adb/openlist/bin/openlist $MODROOT/bin/openlist $MODROOT/system/bin/openlist"
-    
+    local dyn
+    dyn="$(get_service_var OPENLIST_BINARY)"
+    case "$dyn" in '$MODDIR'*) dyn="$MODROOT${dyn#\$MODDIR}" ;; esac
+    local paths="$dyn /data/adb/openlist/bin/openlist $MODROOT/bin/openlist $MODROOT/system/bin/openlist"
+
     for path in $paths; do
         if [ -f "$path" ]; then
             log "正在删除二进制文件：$path"
@@ -47,26 +62,37 @@ clean_binaries() {
             found=1
         fi
     done
-    
+
     if [ $found -eq 0 ]; then
         log "未找到 OpenList 二进制文件"
     fi
 }
 
-# 自动清理数据目录
+# 清理数据目录
+# 卸载脚本在 Magisk 里无法交互，默认【保留】数据：数据库删了没法恢复。
+# 确实要连数据一起删时，卸载前手动创建标记文件：
+#   touch /data/adb/modules/openlist/.delete_data_on_uninstall
 clean_data() {
-    log "开始自动清理数据目录..."
-    local found=0
-    
-    # 清理所有可能的数据目录
-    for dir in "/data/adb/openlist" "/sdcard/Android/openlist"; do
+    local found=0 dyn
+    dyn="$(get_service_var DATA_DIR)"
+    case "$dyn" in '$MODDIR'*) dyn="$MODROOT${dyn#\$MODDIR}" ;; esac
+
+    if [ ! -f "$MODROOT/.delete_data_on_uninstall" ]; then
+        log "已保留数据目录：${dyn:-未知}"
+        [ -n "$dyn" ] && log "如需彻底删除，请手动执行：rm -rf \"$dyn\""
+        log "或在卸载前执行：touch $MODROOT/.delete_data_on_uninstall"
+        return 0
+    fi
+
+    log "检测到 .delete_data_on_uninstall，开始清理数据目录..."
+    for dir in "$dyn" "/data/adb/openlist" "/sdcard/Android/openlist"; do
         if [ -d "$dir" ]; then
             log "正在删除数据目录：$dir"
             rm -rf "$dir"
             found=1
         fi
     done
-    
+
     if [ $found -eq 1 ]; then
         log "数据目录清理完成"
     else
@@ -98,7 +124,7 @@ main() {
     # 清理二进制文件
     clean_binaries
 
-    # 自动清理数据目录
+    # 清理数据（默认保留，见 clean_data）
     clean_data
 
     log "卸载完成"

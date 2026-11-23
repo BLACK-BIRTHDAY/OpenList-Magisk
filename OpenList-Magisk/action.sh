@@ -2,10 +2,12 @@
 # shellcheck shell=ash
 # action.sh for OpenList Magisk Module
 MODDIR="${0%/*}"
+[ -d "$MODDIR" ] || MODDIR="."
+MODDIR="$(cd "$MODDIR" 2>/dev/null && pwd)" || MODDIR="/data/adb/modules/openlist"
 MODULE_PROP="$MODDIR/module.prop"
 SERVICE_SH="$MODDIR/service.sh"
 OPENLIST_BINARY="__PLACEHOLDER_BINARY_PATH__"
-REPO_URL="https://github.com/Alien-Et/OpenList-Magisk"
+REPO_URL="https://github.com/BLACK-BIRTHDAY/OpenList-Magisk"
 
 # 修复：用字符串替代数组，适配 Ash Shell（不支持数组）
 find_busybox() {

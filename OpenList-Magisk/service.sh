@@ -2,11 +2,31 @@
 # shellcheck shell=ash
 # service.sh for OpenList Magisk Module
 
+# 保存调用方预先传入的环境变量（用于单元测试覆盖），同时保持下方路径为纯字面量赋值以兼容 sed 提取与替换
+_ENV_DATA_DIR="${DATA_DIR:-}"
+_ENV_OPENLIST_BINARY="${OPENLIST_BINARY:-}"
+_ENV_MODULE_PROP_FILE="${MODULE_PROP_FILE:-}"
+_ENV_LOG_FILE="${LOG_FILE:-}"
+_ENV_OPENLIST_LOG="${OPENLIST_LOG:-}"
+
 MODDIR="${0%/*}"
-DATA_DIR="${DATA_DIR:-__PLACEHOLDER_DATA_DIR__}"
-OPENLIST_BINARY="${OPENLIST_BINARY:-__PLACEHOLDER_BINARY_PATH__}"
-MODULE_PROP_FILE="${MODULE_PROP_FILE:-$MODDIR/module.prop}"
-LOG_FILE="${LOG_FILE:-$MODDIR/service.log}"
+# 支持相对路径调用（sh service.sh / sh modpath/service.sh）：统一转成绝对目录，
+# 否则 ${0%/*} 会得到 "service.sh" 或 "modpath" 这种相对值，日志/临时文件全部写错位置
+[ -d "$MODDIR" ] || MODDIR="."
+MODDIR="$(cd "$MODDIR" 2>/dev/null && pwd)" || MODDIR="/data/adb/modules/openlist"
+DATA_DIR="__PLACEHOLDER_DATA_DIR__"
+OPENLIST_BINARY="__PLACEHOLDER_BINARY_PATH__"
+MODULE_PROP_FILE="$MODDIR/module.prop"
+LOG_FILE="$MODDIR/service.log"
+OPENLIST_LOG="$MODDIR/openlist.log"
+
+[ -n "$_ENV_DATA_DIR" ] && DATA_DIR="$_ENV_DATA_DIR"
+[ -n "$_ENV_OPENLIST_BINARY" ] && OPENLIST_BINARY="$_ENV_OPENLIST_BINARY"
+[ -n "$_ENV_MODULE_PROP_FILE" ] && MODULE_PROP_FILE="$_ENV_MODULE_PROP_FILE"
+[ -n "$_ENV_LOG_FILE" ] && LOG_FILE="$_ENV_LOG_FILE"
+[ -n "$_ENV_OPENLIST_LOG" ] && OPENLIST_LOG="$_ENV_OPENLIST_LOG"
+unset _ENV_DATA_DIR _ENV_OPENLIST_BINARY _ENV_MODULE_PROP_FILE _ENV_LOG_FILE _ENV_OPENLIST_LOG
+
 TEMP_IP_FILE="$MODDIR/ip_result.tmp"
 TEMP_PORT_FILE="$MODDIR/port_result.tmp"
 
@@ -27,11 +47,11 @@ toast_find_busybox() {
 
 log() {
     # 日志轮转（限制日志文件大小，例如 1MB）
-    if [ -f "$LOG_FILE" ] && [ $(stat -c %s "$LOG_FILE" 2>/dev/null) -gt 1048576 ]; then
-        mv "$LOG_FILE" "${LOG_FILE}.bak"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志文件已轮转" >> "$LOG_FILE"
+    if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+        mv "$LOG_FILE" "${LOG_FILE}.bak" 2>/dev/null || true
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志文件已轮转" >> "$LOG_FILE" 2>/dev/null || true
     fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 get_lan_ip() {
@@ -58,9 +78,20 @@ get_lan_ip() {
     RETRY_COUNT=0
 
     while [ $RETRY_COUNT -lt $MAX_RETRY ]; do
+        # 首选默认路由的出口地址：能避开 docker / tun 的 172.16-31 虚拟网段
+        ip_address=$($IP_CMD route get 1.1.1.1 2>/dev/null | $AWK_CMD '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' | $HEAD_CMD -n 1)
+        case "$ip_address" in
+            172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) ip_address="" ;;
+        esac
+        if [ -n "$ip_address" ]; then
+            log "成功获取 IP（默认路由）: ip_address=$ip_address (尝试次数: $((RETRY_COUNT + 1)))"
+            echo "$ip_address" > "$TEMP_IP_FILE"
+            return 0
+        fi
+
         # 新增：检测是否有活跃的Wi-Fi接口（wlan开头且state UP）
         WLAN_INTERFACE=$($IP_CMD link | $GREP_CMD "state UP" | $AWK_CMD '{print $2}' | $CUT_CMD -d: -f1 | $GREP_CMD -E "^wlan" | $HEAD_CMD -n 1)
-        
+
         if [ -z "$WLAN_INTERFACE" ]; then
             # 无活跃Wi-Fi，判定为移动数据环境，返回localhost
             log "未检测到活跃的Wi-Fi连接，使用移动数据模式"
@@ -177,16 +208,11 @@ update_module_prop_running() {
         log "最终端口: $port"
         DETECTED_PORT="$port"
 
-        PASSWORD_TEXT=""
-        if [ -f "${DATA_DIR}/初始密码.txt" ]; then
-            PASSWORD_TEXT=" | 初始密码：$(cat "${DATA_DIR}/初始密码.txt")"
-        fi
-
         if [ -n "$port" ] && [ "$CURRENT_IP" != "无法获取IP" ]; then
-            NEW_DESC="description=【运行中】当前地址：http://${CURRENT_IP}:${port} | PID:$pid | 数据目录：${DATA_DIR} | 点击▲操作关闭程序${PASSWORD_TEXT}"
+            NEW_DESC="description=【运行中】当前地址：http://${CURRENT_IP}:${port} | PID:$pid | 数据目录：${DATA_DIR} | 点击▲操作关闭程序"
         else
             log "错误: IP 或端口获取失败 (IP: $CURRENT_IP, 端口: $port)"
-            NEW_DESC="description=【运行中】无法检测 openlist 地址（IP: $CURRENT_IP, 端口: $port，PID:$pid），请检查日志 $LOG_FILE | 数据目录：${DATA_DIR} | 点击▲操作关闭程序${PASSWORD_TEXT}"
+            NEW_DESC="description=【运行中】无法检测 openlist 地址（IP: $CURRENT_IP, 端口: $port，PID:$pid），请检查日志 $LOG_FILE | 数据目录：${DATA_DIR} | 点击▲操作关闭程序"
         fi
     fi
 
@@ -245,93 +271,6 @@ extract_openlist_token() {
     token=$(echo "$token" | tr -d '\r' | sed 's/string$//')
 
     echo "$token"
-}
-
-patch_openlist_binary_sqlite_dsn() {
-    local bin_file="${1:-$OPENLIST_BINARY}"
-    [ ! -f "$bin_file" ] && return 0
-    [ ! -w "$bin_file" ] && return 0
-
-    local offsets
-    offsets=$(grep -a -b -oF '%s?_journal=WAL&_vacuum=incremental' "$bin_file" 2>/dev/null | cut -d: -f1)
-    if [ -n "$offsets" ]; then
-        local patched=0
-        for offset in $offsets; do
-            if [ -n "$offset" ] && printf '%%s?_pragma=busy_timeout(10000)&_v=1' | dd of="$bin_file" bs=1 seek="$offset" count=35 conv=notrunc 2>/dev/null; then
-                patched=1
-            fi
-        done
-        if [ "$patched" -eq 1 ]; then
-            chmod 755 "$bin_file" 2>/dev/null || true
-            restorecon "$bin_file" 2>/dev/null || chcon u:object_r:system_file:s0 "$bin_file" 2>/dev/null || true
-            log "已修补 OpenList 二进制 SQLite 连接参数 (busy_timeout=10000ms)"
-        fi
-    elif grep -a -qF '%s?_journal=WAL&_vacuum=incremental' "$bin_file" 2>/dev/null; then
-        if LC_ALL=C sed -b -i 's|%s?_journal=WAL&_vacuum=incremental|%s?_pragma=busy_timeout(10000)\&_v=1|g' "$bin_file" 2>/dev/null || \
-           LC_ALL=C sed -i 's|%s?_journal=WAL&_vacuum=incremental|%s?_pragma=busy_timeout(10000)\&_v=1|g' "$bin_file" 2>/dev/null; then
-            chmod 755 "$bin_file" 2>/dev/null || true
-            restorecon "$bin_file" 2>/dev/null || chcon u:object_r:system_file:s0 "$bin_file" 2>/dev/null || true
-            log "已修补 OpenList 二进制 SQLite 连接参数 (busy_timeout=10000ms)"
-        fi
-    fi
-    return 0
-}
-
-ensure_sqlite_wal_and_clean_locks() {
-    local db_file="${1:-$DATA_DIR/data.db}"
-    [ ! -f "$db_file" ] && return 0
-
-    if [ -n "$OPENLIST_BINARY" ] && pgrep -f "$OPENLIST_BINARY server" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    if [ -f "${db_file}-journal" ] && [ ! -s "${db_file}-journal" ]; then
-        rm -f "${db_file}-journal" 2>/dev/null || true
-    fi
-
-    local db_size
-    db_size=$(wc -c < "$db_file" 2>/dev/null | tr -d ' \n\r')
-    if [ -z "$db_size" ] || [ "$db_size" -lt 100 ]; then
-        return 0
-    fi
-
-    if command -v sqlite3 >/dev/null 2>&1; then
-        sqlite3 "$db_file" "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;" >/dev/null 2>&1 || true
-    fi
-
-    local magic
-    magic=$(head -c 15 "$db_file" 2>/dev/null | tr -d '\0' || true)
-    if [ "$magic" = "SQLite format 3" ] && [ ! -s "${db_file}-journal" ]; then
-        local hex_ver
-        hex_ver=$(od -An -tx1 -j 18 -N 2 "$db_file" 2>/dev/null | tr -d ' \n\r')
-        if [ "$hex_ver" = "0101" ]; then
-            printf '\002\002' | dd of="$db_file" bs=1 seek=18 count=2 conv=notrunc 2>/dev/null || true
-            log "已为 SQLite 数据库启用持久化 WAL 模式: $db_file"
-        fi
-    fi
-    return 0
-}
-
-optimize_openlist_config() {
-    local cfg_file="${1:-$DATA_DIR/config.json}"
-    [ ! -f "$cfg_file" ] && return 0
-    [ ! -w "$cfg_file" ] && return 0
-
-    local updated=0
-    if grep -q '"max_size"[[:space:]]*:[[:space:]]*50' "$cfg_file" 2>/dev/null || \
-       grep -q '"max_backups"[[:space:]]*:[[:space:]]*30' "$cfg_file" 2>/dev/null || \
-       sed -n '/"filter"[[:space:]]*:[[:space:]]*{/,/}/p' "$cfg_file" 2>/dev/null | grep -q '"enable"[[:space:]]*:[[:space:]]*false'; then
-        updated=1
-    fi
-
-    sed -i '/"filter"[[:space:]]*:[[:space:]]*{/,/}/{s/"enable"[[:space:]]*:[[:space:]]*false/"enable": true/;}' "$cfg_file" 2>/dev/null || true
-    sed -i 's/"max_size"[[:space:]]*:[[:space:]]*50/"max_size": 10/g' "$cfg_file" 2>/dev/null || true
-    sed -i 's/"max_backups"[[:space:]]*:[[:space:]]*30/"max_backups": 3/g' "$cfg_file" 2>/dev/null || true
-
-    if [ "$updated" -eq 1 ]; then
-        log "已优化 OpenList 日志配置 (filter.enable=true, max_size=10MB, max_backups=3)"
-    fi
-    return 0
 }
 
 set_companion_menu_enabled() {
@@ -441,21 +380,75 @@ has_enabled_115_storage() {
     fi
 }
 
+bridge_companion_offline_conf() {
+    local conf_file="${1:-$DATA_DIR/offline.conf}"
+    local bridge_tmp="${2:-${BRIDGE_TMP_CONF:-/data/local/tmp/openlist_offline.conf}}"
+    local helper_pkg_dir="${3:-${HELPER_DATA_DIR:-/data/data/io.openlist.helper}}"
+    [ -f "$conf_file" ] || return 0
+
+    # 桥接 offline.conf 至公共临时目录供免权限读取
+    mkdir -p "$(dirname "$bridge_tmp")" 2>/dev/null || true
+    cp -f "$conf_file" "$bridge_tmp" 2>/dev/null || true
+    chmod 644 "$bridge_tmp" 2>/dev/null || true
+    chcon u:object_r:shell_data_file:s0 "$bridge_tmp" 2>/dev/null || true
+
+    # 桥接 offline.conf 至伴侣应用私有目录
+    if [ -d "$helper_pkg_dir" ]; then
+        local helper_files_dir="$helper_pkg_dir/files"
+        mkdir -p "$helper_files_dir" 2>/dev/null || true
+        cp -f "$conf_file" "$helper_files_dir/offline.conf" 2>/dev/null || true
+        local owner_ug
+        owner_ug=$(stat -c %u:%g "$helper_pkg_dir" 2>/dev/null)
+        if [ -n "$owner_ug" ]; then
+            chown "$owner_ug" "$helper_files_dir" "$helper_files_dir/offline.conf" 2>/dev/null || true
+        fi
+        chmod 700 "$helper_files_dir" 2>/dev/null || true
+        chmod 600 "$helper_files_dir/offline.conf" 2>/dev/null || true
+        restorecon -R "$helper_files_dir" 2>/dev/null || true
+    fi
+    return 0
+}
+
+refresh_companion_menu_visibility() {
+    local port="${1:-${DETECTED_PORT:-5244}}"
+    local check_running="${2:-1}"
+    [ -z "$port" ] && port="5244"
+
+    if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
+        set_companion_menu_enabled 0
+        return 0
+    fi
+    if [ "$check_running" = "1" ]; then
+        if ! pgrep -f "$OPENLIST_BINARY server" >/dev/null 2>&1 && \
+           ! pgrep -f "openlist server" >/dev/null 2>&1; then
+            set_companion_menu_enabled 0
+            return 0
+        fi
+    fi
+    if has_enabled_115_storage "$port"; then
+        set_companion_menu_enabled 1
+    else
+        log "未检测到已启用的 115 网盘存储，隐藏 115 离线下载系统菜单入口"
+        set_companion_menu_enabled 0
+    fi
+    return 0
+}
+
 install_boot_companion_sync_guard() {
     local service_d="${SERVICE_D_DIR:-/data/adb/service.d}"
     local guard_script="$service_d/openlist_companion_sync.sh"
     mkdir -p "$service_d" 2>/dev/null || true
     cat > "$guard_script" << EOF
 #!/system/bin/sh
-MODDIR="$MODDIR"
-OPENLIST_BINARY="$OPENLIST_BINARY"
-if [ ! -d "\$MODDIR" ] || [ -f "\$MODDIR/disable" ] || [ -f "\$MODDIR/remove" ]; then
+GUARD_MODDIR="$MODDIR"
+GUARD_OPENLIST_BINARY="$OPENLIST_BINARY"
+if [ ! -d "\$GUARD_MODDIR" ] || [ -f "\$GUARD_MODDIR/disable" ] || [ -f "\$GUARD_MODDIR/remove" ]; then
     if command -v pm >/dev/null 2>&1; then
         pm disable io.openlist.helper/io.openlist.helper.ProcessTextActivity >/dev/null 2>&1 || true
     fi
     exit 0
 fi
-if ! pgrep -f "\$OPENLIST_BINARY server" >/dev/null 2>&1; then
+if ! pgrep -f "\$GUARD_OPENLIST_BINARY server" >/dev/null 2>&1; then
     if command -v pm >/dev/null 2>&1; then
         pm disable io.openlist.helper/io.openlist.helper.ProcessTextActivity >/dev/null 2>&1 || true
     fi
@@ -565,36 +558,10 @@ EOF
 
     # 5. 校验 115 存储状态并同步伴侣系统菜单可见性
     install_boot_companion_sync_guard
-    if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
-        set_companion_menu_enabled 0
-    elif has_enabled_115_storage "$target_port"; then
-        set_companion_menu_enabled 1
-    else
-        log "未检测到已启用的 115 网盘存储，隐藏 115 离线下载系统菜单入口"
-        set_companion_menu_enabled 0
-    fi
+    refresh_companion_menu_visibility "$target_port" 0
 
-    # 6. 桥接 offline.conf 至公共临时目录供免权限读取
-    local bridge_tmp="${BRIDGE_TMP_CONF:-/data/local/tmp/openlist_offline.conf}"
-    cp -f "$conf_file" "$bridge_tmp" 2>/dev/null || true
-    chmod 644 "$bridge_tmp" 2>/dev/null || true
-    chcon u:object_r:shell_data_file:s0 "$bridge_tmp" 2>/dev/null || true
-
-    # 7. 桥接 offline.conf 至伴侣应用私有目录
-    local helper_pkg_dir="${HELPER_DATA_DIR:-/data/data/io.openlist.helper}"
-    if [ -d "$helper_pkg_dir" ]; then
-        local helper_files_dir="$helper_pkg_dir/files"
-        mkdir -p "$helper_files_dir" 2>/dev/null || true
-        cp -f "$conf_file" "$helper_files_dir/offline.conf" 2>/dev/null || true
-        local owner_ug
-        owner_ug=$(stat -c %u:%g "$helper_pkg_dir" 2>/dev/null)
-        if [ -n "$owner_ug" ]; then
-            chown "$owner_ug" "$helper_files_dir" "$helper_files_dir/offline.conf" 2>/dev/null || true
-        fi
-        chmod 700 "$helper_files_dir" 2>/dev/null || true
-        chmod 600 "$helper_files_dir/offline.conf" 2>/dev/null || true
-        restorecon -R "$helper_files_dir" 2>/dev/null || true
-    fi
+    # 6. 桥接 offline.conf 至公共临时目录与伴侣应用私有目录
+    bridge_companion_offline_conf "$conf_file"
 }
 
 reload_openlist_storages() {
@@ -650,11 +617,51 @@ main() {
         exit 0
     fi
 
+    # 早期日志：排查"重启后没自动起来"时，先看这两行路径对不对
+    log "数据目录: $DATA_DIR ；二进制: $OPENLIST_BINARY"
+
     if ! command -v ip >/dev/null; then
-        log "错误: 未找到 ip 命令"
-        set_companion_menu_enabled 0
-        exit 1
+        log "警告: 未找到 ip 命令，IP 检测会失败，但服务仍会继续启动"
     fi
+
+    # 先等启动阶段过去再碰数据目录：
+    # late_start 阶段 /sdcard(FUSE) 往往还没挂载，数据目录在外部存储时提前 mkdir
+    # 会直接失败退出，表现出来就是"重启后模块没有自动启动"
+    ELAPSED=0
+    MAX_WAIT=120
+    while [ $ELAPSED -lt $MAX_WAIT ]; do
+        if [ "$(getprop sys.boot_completed)" = "1" ]; then
+            log "Android 系统启动完成"
+            break
+        fi
+        log "等待 Android 系统启动... ($ELAPSED/$MAX_WAIT 秒)"
+        sleep 1
+        ELAPSED=$((ELAPSED + 1))
+    done
+    if [ $ELAPSED -ge $MAX_WAIT ]; then
+        log "警告: 系统启动超时，继续尝试启动 openlist"
+    fi
+
+    # 数据目录在外部存储时再单独等它就绪（部分机型 boot_completed 之后 FUSE 才可用）
+    case "$DATA_DIR" in
+        /sdcard/*|/storage/*)
+            WAIT_STORAGE=0
+            while [ $WAIT_STORAGE -lt 180 ]; do
+                if mkdir -p "$DATA_DIR" 2>/dev/null && [ -w "$DATA_DIR" ]; then
+                    log "外部存储已就绪：$DATA_DIR"
+                    break
+                fi
+                log "等待外部存储就绪... ($WAIT_STORAGE/180 秒)"
+                sleep 1
+                WAIT_STORAGE=$((WAIT_STORAGE + 1))
+            done
+            if [ $WAIT_STORAGE -ge 180 ]; then
+                log "错误: 外部存储 180 秒内仍不可写：$DATA_DIR（/sdcard 可能未挂载）"
+                set_companion_menu_enabled 0
+                exit 1
+            fi
+            ;;
+    esac
 
     if [ ! -f "$OPENLIST_BINARY" ]; then
         log "错误: $OPENLIST_BINARY 不存在"
@@ -686,29 +693,19 @@ main() {
     fi
     log "已创建或验证数据目录：$DATA_DIR"
 
-    ELAPSED=0
-    MAX_WAIT=60
-    while [ $ELAPSED -lt $MAX_WAIT ]; do
-        if [ "$(getprop sys.boot_completed)" = "1" ]; then
-            log "Android 系统启动完成"
-            break
-        fi
-        log "等待 Android 系统启动... ($ELAPSED/$MAX_WAIT 秒)"
-        sleep 1
-        ELAPSED=$((ELAPSED + 1))
-    done
-
-    if [ $ELAPSED -ge $MAX_WAIT ]; then
-        log "警告: 系统启动超时，继续尝试启动 openlist"
+    log "启动 OpenList: $OPENLIST_BINARY server --data $DATA_DIR"
+    # 程序自身的 stdout/stderr 落到 openlist.log（1MB 轮转）。
+    # 这些内容不会进 service.log，但端口占用、驱动加载失败、数据库锁冲突
+    # 这类只在运行中出现一次的报错只有在这里才看得到。
+    if [ -f "$OPENLIST_LOG" ] && [ "$(stat -c %s "$OPENLIST_LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+        mv -f "$OPENLIST_LOG" "$OPENLIST_LOG.bak" 2>/dev/null
     fi
 
-    # 启动前修补 SQLite 连接超时与 WAL 持久化头，并调优日志轮转
-    patch_openlist_binary_sqlite_dsn "$OPENLIST_BINARY"
-    ensure_sqlite_wal_and_clean_locks "$DATA_DIR/data.db"
-    optimize_openlist_config "$DATA_DIR/config.json"
-
-    log "启动 OpenList: $OPENLIST_BINARY server --data $DATA_DIR"
-    $OPENLIST_BINARY server --data "$DATA_DIR" </dev/null >/dev/null 2>&1 &
+    # 不预设 admin 密码：OpenList v4.2.10 起由网页安装向导创建管理员
+    # （POST /api/public/init/setup），首次打开 http://IP:PORT 会引导设置账号密码。
+    # 输出落到 openlist.log：WebUI 能看日志，同时避免 service.sh 退出、终端/管道关闭后
+    # openlist 再往 stderr 写时收到 SIGPIPE 直接退出（PR #38 反馈的问题）
+    "$OPENLIST_BINARY" server --data "$DATA_DIR" >> "$OPENLIST_LOG" 2>&1 </dev/null &
     OPENLIST_PID=$!
 
     if ps -p $OPENLIST_PID >/dev/null || pgrep -f "$OPENLIST_BINARY server --data" >/dev/null; then
@@ -722,7 +719,7 @@ main() {
     else
         log "错误: 无法启动 OpenList 服务"
         set_companion_menu_enabled 0
-        OUTPUT=$($OPENLIST_BINARY server --data "$DATA_DIR" 2>&1)
+        OUTPUT=$("$OPENLIST_BINARY" server --data "$DATA_DIR" 2>&1)
         log "手动运行输出: $OUTPUT"
         exit 1
     fi

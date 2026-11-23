@@ -16,6 +16,18 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# 从 service.sh 读取安装/迁移后的实际路径（兼容旧版 ${VAR:-...} 写法）
+get_service_var() {
+    local val
+    val="$(sed -n "s/^$1=\"\\(.*\\)\"/\\1/p" "$MODROOT/service.sh" 2>/dev/null | head -n 1)"
+    case "$val" in
+        '${'"$1"':-'*'}')
+            val="$(printf '%s\n' "$val" | sed -e "s/^[$]{$1:-//" -e 's/}$//')"
+            ;;
+    esac
+    printf '%s\n' "$val"
+}
+
 # 停止服务函数
 stop_service() {
     if pgrep -f openlist >/dev/null; then
@@ -38,8 +50,11 @@ stop_service() {
 # 清理二进制文件
 clean_binaries() {
     local found=0
-    local paths="/data/adb/openlist/bin/openlist $MODROOT/bin/openlist $MODROOT/system/bin/openlist"
-    
+    local dyn
+    dyn="$(get_service_var OPENLIST_BINARY)"
+    case "$dyn" in '$MODDIR'*) dyn="$MODROOT${dyn#\$MODDIR}" ;; esac
+    local paths="$dyn /data/adb/openlist/bin/openlist $MODROOT/bin/openlist $MODROOT/system/bin/openlist"
+
     for path in $paths; do
         if [ -f "$path" ]; then
             log "正在删除二进制文件：$path"
@@ -47,7 +62,7 @@ clean_binaries() {
             found=1
         fi
     done
-    
+
     if [ $found -eq 0 ]; then
         log "未找到 OpenList 二进制文件"
     fi
@@ -67,7 +82,10 @@ clean_data() {
             ;;
         2)
             log "开始清理数据目录..."
-            for dir in "/data/adb/openlist" "/sdcard/Android/openlist"; do
+            local dyn
+            dyn="$(get_service_var DATA_DIR)"
+            case "$dyn" in '$MODDIR'*) dyn="$MODROOT${dyn#\$MODDIR}" ;; esac
+            for dir in "$dyn" "/data/adb/openlist" "/sdcard/Android/openlist"; do
                 if [ -d "$dir" ]; then
                     log "正在删除数据目录：$dir"
                     rm -rf "$dir"
@@ -87,13 +105,13 @@ main() {
 
     # 停止服务
     stop_service
-    
+
     # 清理二进制文件
     clean_binaries
-    
+
     # 清理数据（用户选择）
     clean_data
-    
+
     log "卸载完成"
     echo "请重启设备以完成卸载"
 }

@@ -1,5 +1,14 @@
+# 打包产物
+openlist-magisk-*.zip
 *.zip
 *.tar.gz
+
+# CI / 本地打包时下载的二进制（由 workflow 每次重新下载，不入库）
+OpenList-Magisk/openlist-arm
+OpenList-Magisk/openlist-arm64
+
+# 本地打包与开发临时目录
+.build/
 temp_bins/
 .claude/
 graphify-out/

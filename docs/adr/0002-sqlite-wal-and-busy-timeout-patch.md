@@ -1,5 +1,12 @@
 # SQLite 并发锁自愈（WAL 与 Busy Timeout 补丁）及日志轮转调优
 
+- **状态（Status）**：`Superseded`（已取代 / 已退役，自 `v4.2.10` 合并起）
+
+> **取代说明（Superseding Note）**：本 ADR 已退役，保留本文档仅供历史追溯。
+> - 上游 [OpenListTeam/OpenList PR #3344](https://github.com/OpenListTeam/OpenList/pull/3344)（commit `f2dcf4a8`，随 `v4.2.10` 发布）已在源码侧原生采用 `_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)`，并在存储持久化路径加入了 5 次 `SQLITE_BUSY` 重试，彻底根治了 `glebarez/sqlite`（`modernc.org/sqlite`）驱动的 WAL 未生效与 `busy_timeout=0` 缺陷。
+> - 上游 [Alien-Et/OpenList-Magisk](https://github.com/Alien-Et/OpenList-Magisk) 在 `v4.2.10` 中为模块新增了 `openlist.log` 1MB 自动轮转机制与 `</dev/null` 重定向。
+> - 因此，在合并上游 `v4.2.10` 时，本分支已正式移除 `service.sh` 中的运行时二进制 DSN 补丁（`patch_openlist_binary_sqlite_dsn`）、WAL 锁自愈（`ensure_sqlite_wal_and_clean_locks`）与 `config.json` 日志调优（`optimize_openlist_config`）实现及对应单元测试与实施计划。
+
 在 `OpenList-Magisk` 模块的守护服务脚本（`service.sh`）启动阶段，通过原生修改 `data.db` 头部持久化标记为 WAL（Write-Ahead Logging）模式、在 `openlist` 二进制中原位植入 35 字节的 `busy_timeout(10000)` DSN 补丁，并自动开启 `config.json` 日志过滤中间件与收紧日志轮转配置，彻底解决 WebDAV 客户端高并发 `PROPFIND` 请求下的 `SQLITE_BUSY (database is locked)` 死锁与磁盘日志爆满问题。
 
 ## 背景与问题分析（Context & Problem Statement）

@@ -1396,6 +1396,44 @@ else
 fi
 
 # -------------------------------------------------------------
+# 测试 26: customize.sh 在 KernelSU / APatch 下优先使用 MODPATH 解析 MODROOT
+# -------------------------------------------------------------
+echo ""
+echo "-> 测试 26: customize.sh MODROOT 解析（KernelSU / APatch 优先 MODPATH，空时回退 MODULEROOT）"
+
+eval_customize_modroot() {
+    local env_args=("$@")
+    env -i PATH="$PATH" "${env_args[@]}" sh -c '
+        eval "$(sed -n "1,/^MODDIR=/p" "$1")"
+        printf "%s|%s\n" "$MODROOT" "$MODDIR"
+    ' _ "$CUSTOMIZE_SH"
+}
+
+assert_eq "/data/adb/modules_update/openlist|/data/adb/modules_update/openlist" \
+    "$(eval_customize_modroot KSU=true MODPATH=/data/adb/modules_update/openlist MODULEROOT=/data/adb/modules_update)" \
+    "KSU=true 且 MODPATH/MODULEROOT 同时存在时 MODROOT 解析为 MODPATH"
+
+assert_eq "/data/adb/modules_update/openlist|/data/adb/modules_update/openlist" \
+    "$(eval_customize_modroot KERNELSU=true MODPATH=/data/adb/modules_update/openlist MODULEROOT=/data/adb/modules_update)" \
+    "KERNELSU=true 且 MODPATH/MODULEROOT 同时存在时 MODROOT 解析为 MODPATH"
+
+assert_eq "/data/adb/modules_update/openlist|/data/adb/modules_update/openlist" \
+    "$(eval_customize_modroot APATCH=true MODPATH=/data/adb/modules_update/openlist MODULEROOT=/data/adb/modules_update)" \
+    "APATCH=true 且 MODPATH/MODULEROOT 同时存在时 MODROOT 解析为 MODPATH"
+
+assert_eq "/data/adb/modules_update|/data/adb/modules_update" \
+    "$(eval_customize_modroot KSU=true MODPATH= MODULEROOT=/data/adb/modules_update)" \
+    "KSU=true 且 MODPATH 为空时 MODROOT 回退至 MODULEROOT"
+
+assert_eq "/data/adb/modules_update|/data/adb/modules_update" \
+    "$(eval_customize_modroot APATCH=true MODPATH= MODULEROOT=/data/adb/modules_update)" \
+    "APATCH=true 且 MODPATH 为空时 MODROOT 回退至 MODULEROOT"
+
+assert_eq "/data/adb/modules_update/openlist|/data/adb/modules_update/openlist" \
+    "$(eval_customize_modroot MAGISK_VER=28.0 MODPATH=/data/adb/modules_update/openlist MODULEROOT=/data/adb/modules_update)" \
+    "MAGISK_VER 存在时 MODROOT 解析为 MODPATH"
+
+# -------------------------------------------------------------
 # 测试汇总报告
 # -------------------------------------------------------------
 echo ""

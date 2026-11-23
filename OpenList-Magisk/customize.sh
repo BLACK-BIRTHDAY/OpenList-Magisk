@@ -1,14 +1,16 @@
 # shellcheck shell=ash
 
 #==== 侦探：Magisk or KernelSU or APatch ====
+# Magisk、KernelSU/KernelSU Next 与 APatch 均将模块解压至 $MODPATH（/data/adb/modules_update/<id>），
+# $MODULEROOT 是父目录（/data/adb/modules_update），仅在 $MODPATH 为空时作为兜底。
 if [ -n "$MAGISK_VER" ]; then
     MODROOT="$MODPATH"
 elif [ -n "$KSU" ] || [ -n "$KERNELSU" ]; then
-    MODROOT="$MODULEROOT"
+    MODROOT="${MODPATH:-$MODULEROOT}"
 elif [ -n "$APATCH" ]; then
-    MODROOT="$MODULEROOT"
+    MODROOT="${MODPATH:-$MODULEROOT}"
 else
-    MODROOT="$MODPATH"  # 兜底，保持旧逻辑
+    MODROOT="${MODPATH:-$MODULEROOT}"  # 兜底，保持旧逻辑
 fi
 #==== 侦探结束 ====
 

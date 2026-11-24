@@ -246,31 +246,55 @@ update_module_prop_running() {
 
 extract_openlist_token() {
     local db_file="$DATA_DIR/data.db"
-    [ ! -f "$db_file" ] && return 0
-
     local token=""
-    # 方法 1：若存在 sqlite3 命令则直接查询 x_setting_items
-    if command -v sqlite3 >/dev/null 2>&1; then
-        token=$(sqlite3 "$db_file" "SELECT value FROM x_setting_items WHERE key='token' LIMIT 1;" 2>/dev/null)
+
+    # Tier 1（主方案）：直接通过 openlist admin token 读取，天然兼容 WAL 模式且无需 sqlite3
+    if [ -x "$OPENLIST_BINARY" ] && [ -d "$DATA_DIR" ]; then
+        local cli_out=""
+        if cli_out=$("$OPENLIST_BINARY" admin token --data "$DATA_DIR" 2>/dev/null); then
+            token=$(printf '%s\n' "$cli_out" | sed -n 's/.*[Aa]dmin [Tt]oken:[[:space:]]*//p' | head -n 1)
+            if [ -z "$token" ]; then
+                token=$(printf '%s\n' "$cli_out" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9._-]{16,}$' | head -n 1 || true)
+            fi
+            token=$(printf '%s' "$token" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/string.*$//')
+            if printf '%s\n' "$token" | grep -qE '^[A-Za-z0-9._-]{16,}$'; then
+                printf '%s\n' "$token"
+                return 0
+            fi
+            token=""
+        fi
     fi
 
+    # Tier 2：若存在 sqlite3 命令则直接查询 x_setting_items
+    if [ -f "$db_file" ] && command -v sqlite3 >/dev/null 2>&1; then
+        token=$(sqlite3 "$db_file" "SELECT value FROM x_setting_items WHERE key='token' LIMIT 1;" 2>/dev/null || true)
+        token=$(printf '%s' "$token" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/string.*$//')
+        if [ -n "$token" ]; then
+            printf '%s\n' "$token"
+            return 0
+        fi
+    fi
+
+    # Tier 3：纯二进制/字符串正则兜底（WAL 感知：先扫 data.db 再扫 data.db-wal，取最后一条以命中最新帧）
     local token_regex='(openlist|alist)-[A-Za-z0-9._-]{20,}'
+    local scan_f cand
+    for scan_f in "$db_file" "${db_file}-wal"; do
+        [ -f "$scan_f" ] || continue
+        cand=""
+        cand=$(grep -aoE "$token_regex" "$scan_f" 2>/dev/null | tail -n 1 || true)
+        if [ -z "$cand" ] && command -v strings >/dev/null 2>&1; then
+            cand=$(strings "$scan_f" 2>/dev/null | grep -oE "$token_regex" | tail -n 1 || true)
+        fi
+        if [ -z "$cand" ]; then
+            cand=$(tr -cd '[:print:]\n' < "$scan_f" 2>/dev/null | grep -oE "$token_regex" | tail -n 1 || true)
+        fi
+        [ -n "$cand" ] && token="$cand"
+    done
 
-    # 方法 2：纯二进制/字符串正则兜底（免 sqlite3 依赖，兼容所有 Android 固件）
-    if [ -z "$token" ]; then
-        token=$(grep -aoE "$token_regex" "$db_file" 2>/dev/null | head -n 1)
-    fi
-    if [ -z "$token" ] && command -v strings >/dev/null 2>&1; then
-        token=$(strings "$db_file" 2>/dev/null | grep -oE "$token_regex" | head -n 1)
-    fi
-    if [ -z "$token" ]; then
-        token=$(tr -cd '[:print:]\n' < "$db_file" 2>/dev/null | grep -oE "$token_regex" | head -n 1)
-    fi
-
-    # SQLite 二进制页面中，x_setting_items 表里 value 紧跟 type='string'，纯二进制抽取会贪婪带出尾部 string
-    token=$(echo "$token" | tr -d '\r' | sed 's/string$//')
-
-    echo "$token"
+    # SQLite 二进制页面中，x_setting_items 表里 value 紧跟 type='string' 及后续变长字节，贪婪匹配会带出 string / string7v 等尾巴
+    token=$(printf '%s' "$token" | tr -d '\r\n' | sed 's/string.*$//')
+    [ -n "$token" ] && printf '%s\n' "$token"
+    return 0
 }
 
 set_companion_menu_enabled() {
@@ -404,7 +428,8 @@ bridge_companion_offline_conf() {
         fi
         chmod 700 "$helper_files_dir" 2>/dev/null || true
         chmod 600 "$helper_files_dir/offline.conf" 2>/dev/null || true
-        restorecon -R "$helper_files_dir" 2>/dev/null || true
+        restorecon -R "$helper_files_dir" >/dev/null 2>&1 || true
+        restorecon "$helper_files_dir/offline.conf" >/dev/null 2>&1 || true
     fi
     return 0
 }
@@ -459,7 +484,12 @@ EOF
 
 watch_module_disable_state() {
     local interval="${WATCH_INTERVAL:-3}"
+    local watch_port="${DETECTED_PORT:-5244}"
+    [ -z "$watch_port" ] && watch_port="5244"
+    local conf_file="$DATA_DIR/offline.conf"
+    local bridge_tmp="${BRIDGE_TMP_CONF:-/data/local/tmp/openlist_offline.conf}"
     local last_menu_state=""
+    local token_backfill_tried=0
     while pgrep -f "$OPENLIST_BINARY server" >/dev/null 2>&1; do
         if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
             log "检测到模块已禁用或待移除，正在停止 OpenList 服务并隐藏 115 离线菜单"
@@ -468,8 +498,23 @@ watch_module_disable_state() {
             return 0
         fi
         local desired_state="0"
-        if has_enabled_115_storage "${DETECTED_PORT:-5244}"; then
+        if has_enabled_115_storage "$watch_port"; then
             desired_state="1"
+            local conf_tok="" bridge_tok=""
+            [ -f "$conf_file" ] && conf_tok=$(grep -E '^TOKEN=' "$conf_file" 2>/dev/null | head -n 1 | cut -d'=' -f2- | tr -d '\r[:space:]')
+            [ -f "$bridge_tmp" ] && bridge_tok=$(grep -E '^TOKEN=' "$bridge_tmp" 2>/dev/null | head -n 1 | cut -d'=' -f2- | tr -d '\r[:space:]')
+            if [ -z "$conf_tok" ] || [ -z "$bridge_tok" ]; then
+                if [ -n "$conf_tok" ] || [ -n "$(extract_openlist_token 2>/dev/null || true)" ]; then
+                    if [ "$token_backfill_tried" -eq 0 ]; then
+                        log "检测到伴侣配置 TOKEN 为空，自动补齐并桥接配置"
+                        sync_companion_apk_and_config "$watch_port"
+                        last_menu_state="1"
+                        token_backfill_tried=1
+                    fi
+                fi
+            else
+                token_backfill_tried=0
+            fi
         fi
         if [ "$desired_state" != "$last_menu_state" ]; then
             set_companion_menu_enabled "$desired_state"

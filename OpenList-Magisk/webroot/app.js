@@ -144,28 +144,70 @@
       if (!hasKsu) return resolve({ errno: -1, stdout: '', stderr: 'NO_KSU' });
       var name = '__cb_' + Date.now() + '_' + (cbSeq++);
       var done = false;
+      var timer = null;
       function finish(r) {
         if (done) return;
         done = true;
-        try { delete window[name]; } catch (e) {}
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        var ct = setTimeout(function () {
+          try { delete window[name]; } catch (e) {}
+        }, 1000);
+        if (ct && ct.unref) ct.unref();
         resolve(r);
       }
-      window[name] = function (errno, stdout, stderr) {
-        finish({ errno: errno == null ? 0 : errno, stdout: stdout || '', stderr: stderr || '' });
-      };
-      try {
-        var r = window.ksu.exec(cmd, '{}', name);
-        if (typeof r === 'string') finish({ errno: 0, stdout: r, stderr: '' });
-      } catch (e) {
+      function runExec() {
+        window[name] = function (errno, stdout, stderr) {
+          finish({ errno: errno == null ? 0 : errno, stdout: stdout || '', stderr: stderr || '' });
+        };
         try {
-          var r2 = window.ksu.exec(cmd);
-          if (typeof r2 === 'string') finish({ errno: 0, stdout: r2, stderr: '' });
-          else finish({ errno: -1, stdout: '', stderr: String(e) });
-        } catch (e2) {
-          finish({ errno: -1, stdout: '', stderr: String(e2) });
+          var r = window.ksu.exec(cmd, '{}', name);
+          if (typeof r === 'string') finish({ errno: 0, stdout: r, stderr: '' });
+        } catch (e) {
+          try {
+            var r2 = window.ksu.exec(cmd);
+            if (typeof r2 === 'string') finish({ errno: 0, stdout: r2, stderr: '' });
+            else finish({ errno: -1, stdout: '', stderr: String(e) });
+          } catch (e2) {
+            finish({ errno: -1, stdout: '', stderr: String(e2) });
+          }
         }
       }
-      setTimeout(function () { finish({ errno: -1, stdout: '', stderr: 'TIMEOUT' }); }, timeout);
+      timer = setTimeout(function () { finish({ errno: -1, stdout: '', stderr: 'TIMEOUT' }); }, timeout);
+      if (typeof window.ksu.spawn === 'function') {
+        var out = [];
+        var err = [];
+        window[name] = {
+          stdout: {
+            emit: function (ev, d) {
+              if (ev === 'data' && d != null) out.push(String(d));
+            }
+          },
+          stderr: {
+            emit: function (ev, d) {
+              if (ev === 'data' && d != null) err.push(String(d));
+            }
+          },
+          emit: function (ev, val) {
+            if (ev === 'exit') {
+              finish({ errno: val == null ? 0 : val, stdout: out.join('\n'), stderr: err.join('\n') });
+            } else if (ev === 'error') {
+              var code = (val && val.exitCode != null) ? val.exitCode : -1;
+              var msg = err.join('\n') || (val && val.message ? String(val.message) : String(val || ''));
+              finish({ errno: code, stdout: out.join('\n'), stderr: msg });
+            }
+          }
+        };
+        try {
+          window.ksu.spawn(cmd, '[]', '{}', name);
+        } catch (e) {
+          runExec();
+        }
+      } else {
+        runExec();
+      }
     });
   }
 
@@ -1439,18 +1481,26 @@
       });
     };
 
-    // 各区块并行加载：串行的话 scan + versions + 存储/任务加起来能拖到几十秒，
-    // 页面上就一直挂着"加载中…"
+    // 分批加载：先让首屏核心状态立即可见，再加载次要本地信息，最后触发外部网络探测，
+    // 避免首屏渲染前被慢速网络或同步宿主桥接阻塞
     refresh();
-    checkUpdate(true);
-    resumeUpdateIfRunning();
-    loadScan();
-    loadVersions();
     loadConfig();
     loadLog();
-    loadStorages();
-    loadTasks();
-    loadMirror().then(pingMirrors);
+    resumeUpdateIfRunning();
+
+    setTimeout(function () {
+      loadScan();
+      loadStorages();
+      loadTasks();
+      loadMirror().then(function () {
+        setTimeout(pingMirrors, 150);
+      });
+    }, 60);
+
+    setTimeout(function () {
+      checkUpdate(true);
+      loadVersions();
+    }, 200);
   }
 
   if (document.readyState === 'loading') {

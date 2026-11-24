@@ -1434,6 +1434,569 @@ assert_eq "/data/adb/modules_update/openlist|/data/adb/modules_update/openlist" 
     "MAGISK_VER 存在时 MODROOT 解析为 MODPATH"
 
 # -------------------------------------------------------------
+# 测试 27: control.sh 100KB 单行 JSON 解析不卡死（check / update）与 versions 冷缓存输出
+# -------------------------------------------------------------
+echo ""
+echo "-> 测试 27: control.sh 100KB 单行 JSON (check / update) 与 versions 冷缓存回显"
+
+GH_MOCK_BIN="$TEST_TMP/gh_mock_bin"
+LATEST_100K_JSON="$TEST_TMP/latest_100k.json"
+RELEASES_MINI_JSON="$TEST_TMP/releases_mini.json"
+mkdir -p "$GH_MOCK_BIN"
+
+# 构造 >100KB、0 换行符的单行压缩 GitHub latest JSON
+awk 'BEGIN {
+    printf "{\"url\":\"https://api.github.com/repos/OpenListTeam/OpenList/releases/1\",\"tag_name\":\"v4.2.10\",\"name\":\"v4.2.10\",\"body\":\"";
+    for (i = 0; i < 1600; i++) printf "changelog_padding_block_0123456789abcdef_openlist_release_notes_";
+    printf "\",\"assets\":[{\"name\":\"openlist-android-arm64.tar.gz\",\"browser_download_url\":\"https://github.com/OpenListTeam/OpenList/releases/download/v4.2.10/openlist-android-arm64.tar.gz\"},{\"name\":\"md5-android.txt\",\"browser_download_url\":\"https://github.com/OpenListTeam/OpenList/releases/download/v4.2.10/md5-android.txt\"}]}"
+}' > "$LATEST_100K_JSON"
+
+printf '%s' '[{"tag_name":"v4.2.10","published_at":"2026-11-19T08:00:00Z","body":"ok"},{"tag_name":"v4.2.9","published_at":"2025-11-11T08:00:00Z","body":"prev"}]' > "$RELEASES_MINI_JSON"
+
+LATEST_SIZE=$(wc -c < "$LATEST_100K_JSON" | tr -d ' ')
+LATEST_LINES=$(wc -l < "$LATEST_100K_JSON" | tr -d ' ')
+TOTAL=$((TOTAL + 1))
+if [ "$LATEST_SIZE" -ge 100000 ] && [ "$LATEST_LINES" -eq 0 ]; then
+    echo "  [PASS] 已构造 >100KB 且 0 换行符的模拟 GitHub JSON (${LATEST_SIZE}B)"
+else
+    echo "  [FAIL] 模拟 JSON 尺寸或换行不符合预期 (size=${LATEST_SIZE}, lines=${LATEST_LINES})"
+    FAILED=$((FAILED + 1))
+fi
+
+cat > "$GH_MOCK_BIN/curl" << EOF
+#!/usr/bin/env bash
+out=""
+write_code=0
+url=""
+while [ \$# -gt 0 ]; do
+    case "\$1" in
+        -o) out="\$2"; shift ;;
+        -w) write_code=1; shift ;;
+        http://*|https://*) url="\$1" ;;
+    esac
+    shift
+done
+src="$LATEST_100K_JSON"
+case "\$url" in
+    *"/releases?per_page="*) src="$RELEASES_MINI_JSON" ;;
+esac
+if [ -n "\$out" ]; then
+    cp -f "\$src" "\$out"
+else
+    cat "\$src"
+fi
+[ "\$write_code" -eq 1 ] && printf '200'
+exit 0
+EOF
+chmod +x "$GH_MOCK_BIN/curl"
+
+# 27a: cmd_check 在 100KB 单行 JSON 下快速完成 (<5s)
+T27_START=$(date +%s)
+CHK_RC=0
+if command -v timeout >/dev/null 2>&1; then
+    CHK_OUT=$(
+        unset DATA_DIR OPENLIST_BINARY MODULE_PROP_FILE LOG_FILE OPENLIST_LOG
+        PATH="$GH_MOCK_BIN:$PATH" TMP_DIR="$CTL_TMP" PROGRESS_FILE="$CTL_TMP/prog27" TOKEN_CACHE="$CTL_TMP/tok27" \
+            timeout 5 sh "$CTL_MOD/control.sh" check
+    ) || CHK_RC=$?
+else
+    CHK_OUT=$(
+        unset DATA_DIR OPENLIST_BINARY MODULE_PROP_FILE LOG_FILE OPENLIST_LOG
+        PATH="$GH_MOCK_BIN:$PATH" TMP_DIR="$CTL_TMP" PROGRESS_FILE="$CTL_TMP/prog27" TOKEN_CACHE="$CTL_TMP/tok27" \
+            sh "$CTL_MOD/control.sh" check
+    ) || CHK_RC=$?
+fi
+T27_ELAPSED=$(( $(date +%s) - T27_START ))
+
+assert_eq "0" "$CHK_RC" "control.sh check 在 100KB 单行 JSON 下正常退出（未卡死超时）"
+assert_all_kv_lines "$CHK_OUT" "control.sh check 输出纯净 key=value"
+assert_eq "v4.2.10" "$(printf '%s\n' "$CHK_OUT" | sed -n 's/^latest=//p')" "control.sh check 正确提取 v4.2.10"
+assert_eq "ok" "$(printf '%s\n' "$CHK_OUT" | sed -n 's/^result=//p')" "control.sh check 返回 result=ok"
+TOTAL=$((TOTAL + 1))
+if [ "$T27_ELAPSED" -lt 5 ]; then
+    echo "  [PASS] control.sh check 耗时 ${T27_ELAPSED}s (<5s)"
+else
+    echo "  [FAIL] control.sh check 耗时过长: ${T27_ELAPSED}s"
+    FAILED=$((FAILED + 1))
+fi
+
+# 27b: cmd_update 在 100KB 单行 JSON 下直接从文件解析并快速完成 (<5s)
+T27U_START=$(date +%s)
+UPD_RC=0
+if command -v timeout >/dev/null 2>&1; then
+    UPD_OUT=$(
+        unset DATA_DIR OPENLIST_BINARY MODULE_PROP_FILE LOG_FILE OPENLIST_LOG
+        PATH="$GH_MOCK_BIN:$PATH" TMP_DIR="$CTL_TMP" PROGRESS_FILE="$CTL_TMP/prog27u" TOKEN_CACHE="$CTL_TMP/tok27u" \
+            timeout 5 sh "$CTL_MOD/control.sh" update
+    ) || UPD_RC=$?
+else
+    UPD_OUT=$(
+        unset DATA_DIR OPENLIST_BINARY MODULE_PROP_FILE LOG_FILE OPENLIST_LOG
+        PATH="$GH_MOCK_BIN:$PATH" TMP_DIR="$CTL_TMP" PROGRESS_FILE="$CTL_TMP/prog27u" TOKEN_CACHE="$CTL_TMP/tok27u" \
+            sh "$CTL_MOD/control.sh" update
+    ) || UPD_RC=$?
+fi
+T27U_ELAPSED=$(( $(date +%s) - T27U_START ))
+
+assert_eq "0" "$UPD_RC" "control.sh update 在 100KB 单行 JSON 下正常退出（未卡死超时）"
+assert_eq "v4.2.10" "$(printf '%s\n' "$UPD_OUT" | sed -n 's/^latest=//p')" "control.sh update 正确提取 v4.2.10"
+assert_eq "1" "$(printf '%s\n' "$UPD_OUT" | sed -n 's/^up_to_date=//p')" "control.sh update 识别当前已是最新版本"
+assert_eq "ok" "$(printf '%s\n' "$UPD_OUT" | sed -n 's/^result=//p')" "control.sh update 返回 result=ok"
+assert_file_not_contains "$CONTROL_SH" 'json="\$\(cat "\$jsonf"' "control.sh cmd_update 不再将 100KB JSON 读入 \$json 变量"
+TOTAL=$((TOTAL + 1))
+if [ "$T27U_ELAPSED" -lt 5 ]; then
+    echo "  [PASS] control.sh update 耗时 ${T27U_ELAPSED}s (<5s)"
+else
+    echo "  [FAIL] control.sh update 耗时过长: ${T27U_ELAPSED}s"
+    FAILED=$((FAILED + 1))
+fi
+
+# 27c: cmd_versions 冷缓存（RELEASES_CACHE 不存在）必须直接输出版本行并写入缓存
+rm -f "$CTL_TMP/openlist_releases.cache"
+VER_RC=0
+VER_OUT=$(
+    unset DATA_DIR OPENLIST_BINARY MODULE_PROP_FILE LOG_FILE OPENLIST_LOG
+    PATH="$GH_MOCK_BIN:$PATH" TMP_DIR="$CTL_TMP" PROGRESS_FILE="$CTL_TMP/prog27v" TOKEN_CACHE="$CTL_TMP/tok27v" \
+        sh "$CTL_MOD/control.sh" versions
+) || VER_RC=$?
+
+assert_eq "0" "$VER_RC" "control.sh versions 冷缓存返回退出码 0"
+TOTAL=$((TOTAL + 1))
+if printf '%s\n' "$VER_OUT" | grep -q '^v4\.2\.10|2026-11-19$' && \
+   printf '%s\n' "$VER_OUT" | grep -q '^v4\.2\.9|2025-11-11$' && \
+   printf '%s\n' "$VER_OUT" | grep -q '^result=ok$'; then
+    echo "  [PASS] control.sh versions 冷缓存 stdout 正确输出 v4.2.10|2026-11-19 与 v4.2.9|2025-11-11"
+else
+    echo "  [FAIL] control.sh versions 冷缓存输出异常: '$VER_OUT'"
+    FAILED=$((FAILED + 1))
+fi
+assert_file_contains "$CTL_TMP/openlist_releases.cache" '^item=v4\.2\.10\|2026-11-19$' "control.sh versions 冷缓存后正确写入 RELEASES_CACHE"
+
+# -------------------------------------------------------------
+# 测试 28: service.sh extract_openlist_token Tier 1 CLI 与 Tier 3 WAL 感知兜底
+# -------------------------------------------------------------
+echo ""
+echo "-> 测试 28: extract_openlist_token Tier 1 (admin token CLI) 与 Tier 3 (WAL 最新帧与 string.* 剥离)"
+
+T28_DATA="$TEST_TMP/t28_data"
+T28_BIN="$TEST_TMP/t28_bin"
+mkdir -p "$T28_DATA" "$T28_BIN"
+dd if=/dev/zero of="$T28_DATA/data.db" bs=4096 count=1 2>/dev/null
+
+# 28a: Tier 1 — 无 sqlite3 且 data.db 为空 4KB 时，通过 openlist admin token 提取
+cat > "$T28_BIN/openlist" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "admin" ] && [ "$2" = "token" ]; then
+    if [ "${MOCK_CLI_MODE:-prefixed}" = "prefixed" ]; then
+        printf 'INFO[2026-11-24] reading config file\nAdmin token: openlist-cliTier1Token998877665544332211\r\n'
+        exit 0
+    elif [ "${MOCK_CLI_MODE:-}" = "bare" ]; then
+        printf 'openlist-cliBareToken112233445566778899\r\n'
+        exit 0
+    else
+        printf 'FATA[0000] failed to open database\n'
+        exit 1
+    fi
+fi
+exit 1
+EOF
+chmod +x "$T28_BIN/openlist"
+
+T28_CLI_PREFIXED=$(
+    DATA_DIR="$T28_DATA" OPENLIST_BINARY="$T28_BIN/openlist" MOCK_CLI_MODE=prefixed bash -c '
+        command() { [ "${1:-}" = "-v" ] && [ "${2:-}" = "sqlite3" ] && return 1; builtin command "$@"; }
+        . "$1"
+        extract_openlist_token
+    ' _ "$SERVICE_SH"
+)
+assert_eq "openlist-cliTier1Token998877665544332211" "$T28_CLI_PREFIXED" "Tier 1: 无 sqlite3 且 data.db 为空 4KB 时通过 admin token (Admin token: 格式) 成功提取"
+
+T28_CLI_BARE=$(
+    DATA_DIR="$T28_DATA" OPENLIST_BINARY="$T28_BIN/openlist" MOCK_CLI_MODE=bare bash -c '
+        command() { [ "${1:-}" = "-v" ] && [ "${2:-}" = "sqlite3" ] && return 1; builtin command "$@"; }
+        . "$1"
+        extract_openlist_token
+    ' _ "$SERVICE_SH"
+)
+assert_eq "openlist-cliBareToken112233445566778899" "$T28_CLI_BARE" "Tier 1: admin token 输出裸 Token 格式时同样正确提取"
+
+# 28b: Tier 3 — CLI 不可用且无 sqlite3 时，空 data.db + data.db-wal 取最新帧并剥离 string7v / string
+T28_WAL_DATA="$TEST_TMP/t28_wal_data"
+mkdir -p "$T28_WAL_DATA"
+dd if=/dev/zero of="$T28_WAL_DATA/data.db" bs=4096 count=1 2>/dev/null
+WAL_OLD_TOK="openlist-walOldFrameToken000000000000old111"
+WAL_NEW_TOK="openlist-walNewFrameToken999999999999new222"
+printf '\x00\x01\xFEtoken%sstring7v\x00\x02\xFFtoken%sstring\x00\x03' "$WAL_OLD_TOK" "$WAL_NEW_TOK" > "$T28_WAL_DATA/data.db-wal"
+
+T28_WAL_RES=$(
+    DATA_DIR="$T28_WAL_DATA" OPENLIST_BINARY="$TEST_TMP/missing_openlist_bin" bash -c '
+        command() { [ "${1:-}" = "-v" ] && [ "${2:-}" = "sqlite3" ] && return 1; builtin command "$@"; }
+        . "$1"
+        extract_openlist_token
+    ' _ "$SERVICE_SH"
+)
+assert_eq "$WAL_NEW_TOK" "$T28_WAL_RES" "Tier 3: 空 data.db + data.db-wal 存在旧/新帧时命中最新帧 new222 并剥离尾部 string"
+
+# 28c: Tier 3 — 最新帧本身带 string7v 尾部且 CLI 报错退出时同样回退并完整剥离 string.*$
+WAL_NEW_7V="openlist-walLatestFrameToken888888888888xyz"
+printf '\x00\x01\xFEtoken%sstring\x00\x02\xFFtoken%sstring7v\x00\x03' "$WAL_OLD_TOK" "$WAL_NEW_7V" > "$T28_WAL_DATA/data.db-wal"
+
+T28_WAL_7V_RES=$(
+    DATA_DIR="$T28_WAL_DATA" OPENLIST_BINARY="$T28_BIN/openlist" MOCK_CLI_MODE=fail bash -c '
+        command() { [ "${1:-}" = "-v" ] && [ "${2:-}" = "sqlite3" ] && return 1; builtin command "$@"; }
+        . "$1"
+        extract_openlist_token
+    ' _ "$SERVICE_SH"
+)
+assert_eq "$WAL_NEW_7V" "$T28_WAL_7V_RES" "Tier 3: CLI 失败回退 WAL 且最新帧带 string7v 时完整剥离 string.*$"
+
+# -------------------------------------------------------------
+# 测试 29: watch_module_disable_state 自动补齐空 TOKEN= 与 bridge_companion_offline_conf 直接 restorecon
+# -------------------------------------------------------------
+echo ""
+echo "-> 测试 29: watch_module_disable_state 空 TOKEN 自动补齐与 bridge_companion_offline_conf 直接 restorecon"
+
+T29_DATA="$TEST_TMP/t29_data"
+T29_MOD="$TEST_TMP/t29_mod"
+T29_BRIDGE="$TEST_TMP/t29_bridge/openlist_offline.conf"
+T29_HELPER="$TEST_TMP/t29_helper"
+T29_READY_FLAG="$TEST_TMP/t29_token_ready"
+T29_LOG="$TEST_TMP/t29_service.log"
+T29_RESTORECON_BIN="$TEST_TMP/t29_restorecon_bin"
+T29_RESTORECON_LOG="$TEST_TMP/t29_restorecon.log"
+mkdir -p "$T29_DATA" "$T29_MOD/bin" "$(dirname "$T29_BRIDGE")" "$T29_HELPER" "$T29_RESTORECON_BIN"
+
+cat > "$T29_MOD/bin/openlist" << EOF
+#!/usr/bin/env bash
+if [ "\$1" = "admin" ] && [ "\$2" = "token" ]; then
+    if [ -f "$T29_READY_FLAG" ]; then
+        echo "Admin token: openlist-watchBackfillToken1234567890abcd"
+        exit 0
+    fi
+    exit 1
+fi
+exit 0
+EOF
+chmod +x "$T29_MOD/bin/openlist"
+
+cat > "$T29_RESTORECON_BIN/restorecon" << EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$T29_RESTORECON_LOG"
+exit 0
+EOF
+chmod +x "$T29_RESTORECON_BIN/restorecon"
+
+# 29a: bridge_companion_offline_conf 必须对 $helper_files_dir/offline.conf 直接执行 restorecon
+cat > "$T29_DATA/offline.conf" << 'EOF'
+HOST=127.0.0.1
+PORT=5244
+TOKEN=
+PATH=/115/影视/
+TOOL=115 Open
+DELETE_POLICY=delete_on_upload_succeed
+PRESET_PATHS=/115/影视/,/115/
+EOF
+: > "$T29_RESTORECON_LOG"
+(
+    PATH="$T29_RESTORECON_BIN:$PATH"
+    bridge_companion_offline_conf "$T29_DATA/offline.conf" "$T29_BRIDGE" "$T29_HELPER"
+)
+assert_file_contains "$T29_RESTORECON_LOG" "^-R ${T29_HELPER}/files$" "bridge_companion_offline_conf 调用 restorecon -R 修复目录上下文"
+assert_file_contains "$T29_RESTORECON_LOG" "^${T29_HELPER}/files/offline\.conf$" "bridge_companion_offline_conf 直接对 offline.conf 调用 restorecon 修复 MCS 标签"
+
+# 29b: watch_module_disable_state 运行期在 TOKEN 可提取后自动补齐 offline.conf 与桥接文件
+printf '\x00\x01/115115 Open\x1ework{}\x00' > "$T29_DATA/data.db"
+rm -f "$T29_READY_FLAG" "$T29_LOG"
+touch "$FAKE_RUNNING"
+
+(
+    export DATA_DIR="$T29_DATA"
+    export MODDIR="$T29_MOD"
+    export OPENLIST_BINARY="$T29_MOD/bin/openlist"
+    export BRIDGE_TMP_CONF="$T29_BRIDGE"
+    export HELPER_DATA_DIR="$T29_HELPER"
+    export SERVICE_D_DIR="$TEST_TMP/t29_service_d"
+    export LOG_FILE="$T29_LOG"
+    export DETECTED_PORT="5244"
+    export WATCH_INTERVAL="0.1"
+    export TOKEN_RETRY_MAX="1"
+    command() { [ "${1:-}" = "-v" ] && [ "${2:-}" = "sqlite3" ] && return 1; builtin command "$@"; }
+    # shellcheck disable=SC1090
+    . "$SERVICE_SH"
+    watch_module_disable_state
+) &
+T29_WATCH_PID=$!
+
+sleep 0.3
+# Token 尚未就绪前应保持空且不刷屏触发自动补齐
+assert_file_contains "$T29_DATA/offline.conf" "^TOKEN=$" "Token 未就绪前 watch_module_disable_state 不误写 TOKEN"
+assert_file_not_contains "$T29_LOG" "自动补齐" "Token 未就绪前 watch_module_disable_state 不刷屏自动补齐日志"
+
+# 模拟 OpenList 初始化完成，Token 变为可提取
+touch "$T29_READY_FLAG"
+T29_TRIES=0
+while [ "$T29_TRIES" -lt 40 ]; do
+    if grep -q '^TOKEN=openlist-watchBackfillToken1234567890abcd$' "$T29_BRIDGE" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+    T29_TRIES=$((T29_TRIES + 1))
+done
+rm -f "$FAKE_RUNNING"
+wait "$T29_WATCH_PID" 2>/dev/null || true
+
+assert_file_contains "$T29_DATA/offline.conf" "^TOKEN=openlist-watchBackfillToken1234567890abcd$" "watch_module_disable_state 自动补齐 DATA_DIR/offline.conf 中的空 TOKEN"
+assert_file_contains "$T29_BRIDGE" "^TOKEN=openlist-watchBackfillToken1234567890abcd$" "watch_module_disable_state 自动补齐并桥接 BRIDGE_TMP_CONF 中的 TOKEN"
+assert_file_contains "$T29_HELPER/files/offline.conf" "^TOKEN=openlist-watchBackfillToken1234567890abcd$" "watch_module_disable_state 自动补齐并桥接伴侣私有目录中的 TOKEN"
+
+# -------------------------------------------------------------
+# 测试 30: webroot/app.js Node 实测 ksu.spawn 协议、非零退出尾随 error、ksu.exec 降级与 init() 分批调度
+# -------------------------------------------------------------
+echo ""
+echo "-> 测试 30: webroot/app.js Node 实测 ksu.spawn 协议、exec 降级与 init() 分批调度"
+
+if command -v node >/dev/null 2>&1; then
+    NODE_SPAWN_RC=0
+    node - "$WEBROOT_APP_JS" << 'EOF' || NODE_SPAWN_RC=$?
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+const appSrc = fs.readFileSync(process.argv[2], 'utf8');
+
+function createHarness(makeKsu) {
+  const els = new Map();
+  const makeEl = (id) => ({
+    id: id || '',
+    textContent: '',
+    value: '',
+    placeholder: '',
+    className: '',
+    title: '',
+    disabled: false,
+    hidden: false,
+    style: {},
+    dataset: {},
+    classList: {
+      toggle() {},
+      add() {},
+      remove() {},
+      contains() { return false; }
+    },
+    querySelector() { return makeEl(); },
+    querySelectorAll() { return []; },
+    appendChild() {},
+    addEventListener() {},
+    remove() {}
+  });
+  const getEl = (id) => {
+    if (!els.has(id)) els.set(id, makeEl(id));
+    return els.get(id);
+  };
+  const storage = new Map();
+  const scheduled = [];
+  const sandbox = {
+    console,
+    Promise,
+    Error,
+    Number,
+    String,
+    Array,
+    Object,
+    Math,
+    Date,
+    JSON,
+    RegExp,
+    btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
+    unescape: global.unescape,
+    encodeURIComponent,
+    decodeURIComponent,
+    location: { pathname: '/data/adb/modules/openlist/webroot/index.html', search: '' },
+    localStorage: {
+      getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+      setItem: (k, v) => storage.set(k, String(v))
+    },
+    document: {
+      readyState: 'complete',
+      documentElement: { setAttribute() {} },
+      body: makeEl('body'),
+      getElementById: getEl,
+      querySelectorAll: () => [],
+      createElement: (tag) => makeEl(tag),
+      addEventListener() {},
+      execCommand: () => true
+    },
+    setTimeout: (fn, ms) => {
+      scheduled.push({ fn, ms });
+      return setTimeout(fn, ms);
+    },
+    clearTimeout: (id) => clearTimeout(id)
+  };
+  sandbox.window = sandbox;
+  sandbox.ksu = makeKsu(sandbox);
+  sandbox.matchMedia = () => null;
+  vm.runInNewContext(appSrc, sandbox, { filename: 'app.js' });
+  return { sandbox, getEl, scheduled };
+}
+
+(async () => {
+  // 1) ksu.spawn 正常多行 stdout 拼接 + 非零退出后紧跟 error 事件不抛异常 + init() 分批调度
+  const spawnLog = [];
+  const spawnDelays = [];
+  let initDone = false;
+  let trailingErrThrown = false;
+  let mirrorGetResolvedAt = 0;
+
+  const h1 = createHarness((sandbox) => ({
+    spawn(cmd, args, opts, cbName) {
+      assert.strictEqual(args, '[]', 'ksu.spawn args must be []');
+      assert.strictEqual(opts, '{}', 'ksu.spawn options must be {}');
+      spawnLog.push({ cmd, sync: !initDone });
+      const cb = sandbox[cbName];
+      assert.ok(cb && cb.stdout && cb.stderr && typeof cb.emit === 'function', 'spawn callback protocol');
+      setTimeout(() => {
+        if (cmd.includes(' status')) {
+          cb.stdout.emit('data', 'running=1');
+          cb.stdout.emit('data', 'pid=5821');
+          cb.stdout.emit('data', 'port=5244');
+          cb.stdout.emit('data', 'ip=192.168.1.247');
+          cb.stdout.emit('data', 'version=v4.2.10');
+          cb.stdout.emit('data', 'result=ok');
+          cb.emit('exit', 0);
+        } else if (cmd.includes(' check')) {
+          // 模拟非零退出后立刻派发 error 事件（ksunext v3.4.2 行为）
+          cb.stderr.emit('data', 'network unreachable');
+          cb.emit('exit', 1);
+          setTimeout(() => {
+            try {
+              const e = new Error('network unreachable');
+              e.exitCode = 1;
+              if (!sandbox[cbName] || typeof sandbox[cbName].emit !== 'function') {
+                throw new Error('cbName deleted too early before trailing error');
+              }
+              sandbox[cbName].emit('error', e);
+            } catch (ex) {
+              trailingErrThrown = ex;
+            }
+          }, 10);
+        } else if (cmd.includes(' mirror-get')) {
+          mirrorGetResolvedAt = Date.now();
+          cb.stdout.emit('data', 'mode=auto');
+          cb.stdout.emit('data', 'list=https://ghfast.top/');
+          cb.stdout.emit('data', 'result=ok');
+          cb.emit('exit', 0);
+        } else if (cmd.includes(' mirror-ping')) {
+          spawnDelays.push({ cmd: 'mirror-ping', afterMirrorGet: Date.now() - mirrorGetResolvedAt });
+          cb.stdout.emit('data', 'item=https://ghfast.top/|120|200');
+          cb.stdout.emit('data', 'result=ok');
+          cb.emit('exit', 0);
+        } else if (cmd.includes(' versions')) {
+          cb.stdout.emit('data', 'v4.2.10|2026-11-19');
+          cb.stdout.emit('data', 'result=ok');
+          cb.emit('exit', 0);
+        } else if (cmd.includes(' api ')) {
+          cb.stdout.emit('data', '{"code":200,"data":[]}');
+          cb.emit('exit', 0);
+        } else {
+          cb.stdout.emit('data', 'result=ok');
+          cb.emit('exit', 0);
+        }
+      }, 5);
+    }
+  }));
+  initDone = true;
+
+  // 校验 init() 同步阶段只发出快速本地命令，慢命令全部延后
+  const syncCmds = spawnLog.filter((x) => x.sync).map((x) => x.cmd);
+  assert.ok(syncCmds.some((c) => c.includes(' status')), 'init() must invoke refresh/status immediately');
+  assert.ok(syncCmds.some((c) => c.includes(' config-get')), 'init() must invoke config-get immediately');
+  assert.ok(syncCmds.some((c) => c.includes(' logs ')), 'init() must invoke logs immediately');
+  assert.ok(syncCmds.some((c) => c.includes(' update-status')), 'init() must invoke update-status immediately');
+  assert.ok(!syncCmds.some((c) => c.includes(' check')), 'init() must defer checkUpdate via setTimeout');
+  assert.ok(!syncCmds.some((c) => c.includes(' versions')), 'init() must defer loadVersions via setTimeout');
+  assert.ok(!syncCmds.some((c) => c.includes(' scan')), 'init() must defer loadScan via setTimeout');
+  assert.ok(!syncCmds.some((c) => c.includes(' mirror-ping')), 'init() must defer mirror-ping');
+  assert.ok(h1.scheduled.some((t) => t.ms === 60), 'init() must schedule 60ms batch');
+  assert.ok(h1.scheduled.some((t) => t.ms === 200), 'init() must schedule 200ms batch');
+
+  // 等待全部异步分批任务与尾随 error 事件完成
+  await new Promise((r) => setTimeout(r, 480));
+
+  assert.strictEqual(trailingErrThrown, false, 'trailing error after non-zero exit must not throw: ' + trailingErrThrown);
+  assert.strictEqual(h1.getEl('stateText').textContent, '运行中', 'spawn stdout multi-line join parsed by status');
+  assert.strictEqual(h1.getEl('pidText').textContent, 'PID 5821', 'spawn stdout pid parsed');
+  assert.strictEqual(h1.getEl('verChip').textContent, 'v4.2.10', 'spawn stdout version parsed');
+  assert.ok(h1.getEl('updateHint').textContent.includes('network unreachable'), 'non-zero exit stderr propagated to UI');
+  assert.ok(spawnLog.some((x) => x.cmd.includes(' check')), 'deferred checkUpdate ran');
+  assert.ok(spawnLog.some((x) => x.cmd.includes(' versions')), 'deferred loadVersions ran');
+  assert.ok(spawnDelays.some((x) => x.cmd === 'mirror-ping' && x.afterMirrorGet >= 100), 'pingMirrors deferred after loadMirror resolves');
+
+  // 2) 仅派发 error 事件（无 exit）时正确使用 exitCode/message 结束 Promise
+  const hErr = createHarness((sandbox) => ({
+    spawn(cmd, args, opts, cbName) {
+      const cb = sandbox[cbName];
+      setTimeout(() => {
+        if (cmd.includes(' check')) {
+          const e = new Error('spawn-only-failure');
+          e.exitCode = 127;
+          cb.emit('error', e);
+        } else {
+          cb.stdout.emit('data', 'result=ok');
+          cb.emit('exit', 0);
+        }
+      }, 2);
+    }
+  }));
+  await new Promise((r) => setTimeout(r, 260));
+  assert.ok(hErr.getEl('updateHint').textContent.includes('spawn-only-failure'), 'error-only spawn event resolves cleanly');
+
+  // 3) 仅存在 ksu.exec（无 spawn）时正确降级到 exec
+  let execCalls = 0;
+  const h2 = createHarness((sandbox) => ({
+    exec(cmd, opts, cbName) {
+      execCalls++;
+      setTimeout(() => {
+        if (cmd.includes(' status')) {
+          sandbox[cbName](0, 'running=1\npid=4242\nversion=v4.2.10\nresult=ok', '');
+        } else {
+          sandbox[cbName](0, 'result=ok', '');
+        }
+      }, 2);
+    }
+  }));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(execCalls > 0, 'must fall back to ksu.exec when ksu.spawn is absent');
+  assert.strictEqual(h2.getEl('pidText').textContent, 'PID 4242', 'ksu.exec fallback renders status');
+
+  // 4) ksu.spawn 同步抛异常时干净降级到 ksu.exec
+  let fallbackExecCalls = 0;
+  const h3 = createHarness((sandbox) => ({
+    spawn() { throw new Error('spawn unsupported'); },
+    exec(cmd, opts, cbName) {
+      fallbackExecCalls++;
+      if (cmd.includes(' status')) {
+        sandbox[cbName](0, 'running=1\npid=7777\nversion=v4.2.10\nresult=ok', '');
+      } else {
+        sandbox[cbName](0, 'result=ok', '');
+      }
+    }
+  }));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(fallbackExecCalls > 0, 'must fall back to ksu.exec when ksu.spawn throws synchronously');
+  assert.strictEqual(h3.getEl('pidText').textContent, 'PID 7777', 'spawn-throw fallback renders status');
+
+  process.exit(0);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+EOF
+    assert_eq "0" "$NODE_SPAWN_RC" "node 实测 webroot/app.js ksu.spawn 协议、尾随 error 安全、ksu.exec 降级与 init() 分批调度全部通过"
+else
+    echo "  [SKIP] 当前环境无 node 命令，跳过 app.js ksu.spawn 动态校验"
+fi
+
+# -------------------------------------------------------------
 # 测试汇总报告
 # -------------------------------------------------------------
 echo ""

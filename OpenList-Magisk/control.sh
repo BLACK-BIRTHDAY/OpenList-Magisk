@@ -608,6 +608,12 @@ pick_asset() {
     esac
 }
 
+extract_json_tag_name() {
+    grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" 2>/dev/null \
+        | head -n 1 \
+        | cut -d'"' -f4
+}
+
 cmd_check() {
     local f code tag cur msg cached
     f="$TMP_DIR/.latest.$$"
@@ -632,7 +638,7 @@ cmd_check() {
         fi
         fail "$msg"
     fi
-    tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)"
+    tag="$(extract_json_tag_name "$f")"
     rm -f "$f"
     [ -n "$tag" ] || fail "解析最新版本失败"
     cur="$(sed -n 's/^version=//p' "$MODULE_PROP" 2>/dev/null | head -n 1)"
@@ -697,7 +703,7 @@ cmd_versions() {
             mv -f "$RELEASES_CACHE.tmp" "$RELEASES_CACHE" 2>/dev/null || true
             chmod 600 "$RELEASES_CACHE" 2>/dev/null || true
             # 回显本次抓到的列表，而不是再读缓存：缓存写失败也不影响本次结果
-            sed -n 's/^item=//p' "$list.ok"
+            cat "$list.ok"
             rm -f "$list" "$list.ok"
             kv result ok
             return 0
@@ -936,7 +942,7 @@ cmd_update_status() {
 }
 
 cmd_update() {
-    local force=0 asset="" tag cur url md5url work tgz md5file want got new_ver new_code want_tag="" api code="" jsonf="" msg="" cached="" DL_PID="" DL_RC=0 sz=0
+    local force=0 asset="" tag="" cur="" url="" md5url="" work tgz md5file want got new_ver new_code want_tag="" api code="" jsonf="" msg="" cached="" DL_PID="" DL_RC=0 sz=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --force) force=1 ;;
@@ -966,10 +972,9 @@ cmd_update() {
         jsonf="$TMP_DIR/.upd_api.$$"
         code="$(gh_api "$API_URL" "$jsonf")"
         if [ "$code" = "200" ]; then
-            json="$(cat "$jsonf" 2>/dev/null)"
-            tag="$(echo "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-            url="$(echo "$json" | tr ',' '\n' | grep -o 'https://[^"]*'"$asset" | head -n 1)"
-            md5url="$(echo "$json" | tr ',' '\n' | grep -o 'https://[^"]*md5-android.txt' | head -n 1)"
+            tag="$(extract_json_tag_name "$jsonf")"
+            url="$(tr ',' '\n' < "$jsonf" 2>/dev/null | grep -o 'https://[^"]*'"$(sed_pattern_escape "$asset")" 2>/dev/null | head -n 1)"
+            md5url="$(tr ',' '\n' < "$jsonf" 2>/dev/null | grep -o 'https://[^"]*md5-android\.txt' 2>/dev/null | head -n 1)"
             kv stale 0
         else
             msg="$(gh_api_error "$code" "$jsonf")"
